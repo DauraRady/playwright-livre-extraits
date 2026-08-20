@@ -3,7 +3,7 @@
 > **Extrait** du livre *Maîtriser JavaScript, TypeScript et Playwright* — Partie 13, Architecture d'un framework Playwright.
 > Daura Rady — version de travail, août 2026.
 
-La plupart des frameworks Playwright que j'ai repris en mission avaient des fixtures. Presque aucun ne s'en servait correctement. On y trouvait un `test.extend` qui instanciait trois Page Objects, et tout le reste du setup empilé dans des hooks.
+La plupart des frameworks Playwright que j'ai repris en mission avaient des fixtures. Presque aucun ne s'en servait correctement. On y trouvait un `test.extend` qui instanciait trois Page Objects, et tout le reste du setup empilé dans des hooks (`beforeEach`, `afterEach`, `beforeAll`, `afterAll` — les blocs d'exécution automatique que Playwright déclenche autour des tests).
 
 Ce chapitre explique pourquoi ce découpage coûte cher, et ce qu'une fixture bien conçue permet réellement.
 
@@ -14,6 +14,8 @@ Ce chapitre explique pourquoi ce découpage coûte cher, et ce qu'une fixture bi
 Les fixtures Playwright sont un système d'**injection de dépendances**. Si vous venez de Spring ou d'Angular, c'est le même principe : le composant déclare ce dont il a besoin, le framework le résout, l'instancie, l'injecte et le nettoie.
 
 Le test ne crée plus ses dépendances. Il les reçoit.
+
+Ce qui justifie vraiment le terme, ce n'est pas seulement que la dépendance soit injectée : c'est que le framework garantit l'exécution du code de préparation et de nettoyage autour du test — voir plus loin la partie sur la garantie de teardown.
 
 ```ts
 test('should update profile', async ({ page, testUser }) => {
@@ -44,13 +46,13 @@ test.afterEach(async ({ request }) => {
 
 Quatre défauts, par ordre de gravité croissante.
 
-**La variable partagée.** `userId` vit au niveau du fichier. Tant que les tests s'exécutent séquentiellement dans leur fichier et que cette variable n'est pas réutilisée de manière concurrente, le problème peut rester invisible — un worker exécute plusieurs tests l'un après l'autre, ce n'est pas un worker par test. Mais cette donnée vit hors du cycle de vie du test, ce qui rend le comportement fragile dès que l'organisation de la suite évolue : un `test.describe.serial` ajouté, l'ordre d'exécution changé, une assertion déplacée, et la variable devient une bombe à retardement.
+**La variable partagée.** `userId` est déclarée au niveau du fichier, donc son cycle de vie n'est plus celui d'un test : c'est le `beforeEach` qui l'écrit, et rien ne la relie au test particulier qui va s'en servir. La redéclarer à l'intérieur d'un `test.describe` réduit le risque de collision entre fichiers, mais ne règle pas le fond du problème à l'intérieur du bloc : la variable n'appartient à aucun test, elle est juste visible par tous ceux qui partagent le même describe. Tant que les tests s'exécutent séquentiellement et que personne n'y touche depuis un autre test, ça tient — un worker exécute plusieurs tests l'un après l'autre, ce n'est pas un worker par test. Mais dès que l'organisation de la suite évolue — un `test.describe.serial` ajouté, l'ordre changé, une assertion déplacée — la variable devient une bombe à retardement, précisément parce qu'elle n'a jamais été liée au test qui l'utilise.
 
 **Le setup s'exécute toujours.** Sur un fichier de cinquante tests dont dix ont besoin d'un utilisateur, le `beforeEach` en crée cinquante. Quarante appels API inutiles par run, multipliés par le nombre de fichiers.
 
 **Setup et teardown sont à deux endroits.** Pour comprendre le cycle de vie d'une donnée il faut lire deux blocs séparés par cinq cents lignes de tests. Six mois plus tard, quelqu'un supprime le `afterEach` en pensant qu'il ne sert à rien.
 
-**Rien n'est typé.** `userId` est un `number` parce qu'on l'a déclaré ainsi, pas parce que l'API le garantit.
+**Rien n'est typé.** `userId` est un `number` parce qu'on l'a déclaré ainsi, pas parce que l'API le garantit. À noter : une fixture ne corrige pas ce défaut par magie, elle a exactement le même besoin d'un type explicite. Ce qu'elle change, c'est que ce type se déclare à un seul endroit — la signature de la fixture — au lieu d'être une convention silencieuse répétée dans chaque fichier de test qui redéclare sa propre variable.
 
 ---
 
@@ -77,6 +79,8 @@ Une fixture reçoit trois arguments :
 | `testInfo` (optionnel) | Les métadonnées du test en cours |
 
 Les dépendances sont elles-mêmes des fixtures. C'est ce qui rend le système composable : vous empilez des briques, Playwright résout l'arbre.
+
+Un hook n'a pas cette propriété : `beforeEach` ne peut pas déclarer qu'il dépend d'un autre `beforeEach`, il s'exécute simplement dans l'ordre où il a été enregistré. C'est exactement le problème de « setup et teardown à deux endroits » vu plus haut, généralisé : les hooks s'empilent, les fixtures se composent.
 
 > 💡 Si tu débutes avec les fixtures, retiens seulement ceci :
 > - une fixture prépare une dépendance,
@@ -124,7 +128,7 @@ Nuance à garder en tête : ce n'est pas une garantie transactionnelle absolue. 
 
 **Le worker meurt.** Crash du processus, mémoire épuisée, job CI annulé. Aucun code JavaScript ne s'exécute après. C'est irréductible côté framework, et ça se traite ailleurs : une routine de purge périodique sur l'environnement de recette, ou un préfixe de nommage qui permet de nettoyer en masse.
 
-**Le budget de teardown est épuisé.** Le temps de setup et de teardown d'une fixture compte dans le timeout du test. Une fixture lente peut donc faire expirer le test, puis se voir couper pendant son propre nettoyage. Voir la section 9.
+**Le budget de teardown est épuisé.** Le temps de setup et de teardown d'une fixture compte dans le timeout du test. Une fixture lente peut donc faire expirer le test, puis se voir couper pendant son propre nettoyage. Voir la section 10.
 
 **La fixture échoue avant d'atteindre `use()`.** C'est le cas le plus fréquent et le seul que vous pouvez traiter dans votre code. Une fixture qui n'a jamais été résolue n'a pas de teardown à exécuter.
 
@@ -180,9 +184,34 @@ Playwright en fournit un jeu prêt à l'emploi. Ce sont celles que vous utilisez
 
 La hiérarchie se lit comme un immeuble : `browser` est le bâtiment, partagé par les locataires d'un même worker. `context` est l'appartement, avec ses propres clés, c'est-à-dire ses cookies et son stockage. `page` est la pièce. Quand un test finit, l'appartement et la pièce sont détruits. L'immeuble reste debout.
 
+Cette liste n'est pas exhaustive : Playwright expose aussi des utilitaires plus ciblés, comme `isMobile` (booléen dérivé du device émulé) ou `acceptDownloads`, qui ne méritent pas une ligne dédiée ici mais valent le détour dans la documentation. La fixture `playwright`, elle, mérite sa place dans ce tableau précisément parce qu'elle n'est pas juste « l'import de Playwright » : elle donne accès à `request.newContext()` sans passer par un navigateur, ce qui est la base de la fixture `adminToken` plus loin (section 7).
+
 ---
 
-## 6. Les scopes
+## 6. Redéfinir une fixture native
+
+On peut surcharger les fixtures fournies par Playwright, y compris `page` et `context`. C'est le moyen le plus propre d'appliquer un comportement à toute la suite.
+
+```ts
+const BLOCKED_DOMAINS = [/google-analytics\.com/, /hotjar\.com/];
+
+page: async ({ page }, use) => {
+  for (const domain of BLOCKED_DOMAINS) {
+    await page.route(domain, route => route.abort());
+  }
+  await use(page);
+},
+```
+
+Deux bénéfices. Les tests gagnent plusieurs centaines de millisecondes chacun, ce qui se voit sur une régression complète. Et surtout, la suite ne dépend plus de la disponibilité de services tiers sur lesquels personne n'a la main. Un test qui échoue parce qu'un CDN d'analytics répond en trois secondes mesure autre chose que ce qu'il prétend mesurer.
+
+**Quand vous surchargez une fixture native, vous devez toujours appeler `use()` avec elle.** Vous enrichissez le comportement, vous ne le remplacez pas. Et la surcharge s'applique à tous les tests qui importent votre `test` custom : assurez-vous que c'est bien l'intention.
+
+> 📌 La liste de domaines ci-dessus est codée en dur pour l'exemple. Une fois les fixtures paramétrables vues plus loin (section 9), vous verrez comment la sortir du code pour en faire une option `blockedDomains` redéfinissable par projet — c'est la suite logique de cet exemple.
+
+---
+
+## 7. Les scopes
 
 Par défaut une fixture est test-scoped : une instance neuve par test, isolation garantie. Le scope worker permet de partager une ressource entre tous les tests qu'un même worker exécute.
 
@@ -190,7 +219,7 @@ Par défaut une fixture est test-scoped : une instance neuve par test, isolation
 |---|---|---|
 | Test (défaut) | Un test | Données métier, Page Objects, tout ce qui est modifié |
 | Worker | Tous les tests d'un worker | Ressources coûteuses sans état métier partagé entre tests : jeton admin, connexion base, client API |
-| Auto | Un test ou un worker, sans être demandée | Instrumentation transversale (section 7) |
+| Auto | Un test ou un worker, sans être demandée | Instrumentation transversale (section 8) |
 
 La règle tient en une ligne : **worker pour les ressources coûteuses dont l'état peut être partagé sans créer de dépendance entre les tests, test pour tout le reste.** Le critère n'est pas une immutabilité littérale — un client DB ou un service peut techniquement évoluer intérieurement (pool de connexions, cache interne) sans que ce soit un problème. Ce qui compte, c'est l'absence d'état métier qui contaminerait les tests suivants.
 
@@ -237,7 +266,7 @@ Traitez les fixtures worker-scoped comme **en lecture seule** depuis un test.
 
 ---
 
-## 7. Les fixtures automatiques
+## 8. Les fixtures automatiques
 
 Une fixture `auto` s'exécute pour chaque test sans qu'il ait à la demander. C'est le bon outil pour l'instrumentation transversale : capture d'erreurs console, mesure de durée, journalisation réseau.
 
@@ -278,9 +307,11 @@ seedDatabase: [async ({}, use) => {
 
 ---
 
-## 8. Les fixtures paramétrables
+## 9. Les fixtures paramétrables
 
 Une fixture déclarée avec `option: true` reçoit une valeur par défaut, redéfinissable depuis la configuration par projet. C'est ce qui permet de faire tourner la même suite sur plusieurs environnements sans variable globale.
+
+Reprenons l'exemple de la fixture `page` qui bloque des domaines tiers, vu à la section 6 : au lieu de coder `BLOCKED_DOMAINS` en dur, on le transforme ici en option `blockedDomains`, redéfinissable par projet exactement comme `apiBaseUrl`.
 
 ```ts
 // fixtures/base.ts
@@ -310,6 +341,19 @@ export default defineConfig<TestOptions>({
 
 Le typage est le point clé. `defineConfig<TestOptions>` fait remonter l'autocomplétion et la vérification jusque dans le fichier de configuration. Une faute de frappe sur `apiBaseUrl` devient une erreur de compilation, pas une suite qui tape sur le mauvais environnement pendant trois semaines.
 
+La fixture `page` qui bloque les domaines, vue à la section 6, se réécrit alors sans valeur codée en dur :
+
+```ts
+page: async ({ page, blockedDomains }, use) => {
+  for (const domain of blockedDomains) {
+    await page.route(domain, route => route.abort());
+  }
+  await use(page);
+},
+```
+
+La liste de domaines vieillit à chaque outil que le marketing ajoute au site : elle n'a plus sa place dans le code des fixtures, une option la sort de là.
+
 ### Le piège du tableau
 
 Si la valeur d'une option est un tableau, il faut l'envelopper dans un tableau supplémentaire au moment de la fournir. La documentation le signale explicitement, et l'oubli est silencieux : Playwright interprète le tableau comme la syntaxe tuple `[valeur, options]` et ne récupère que le premier élément.
@@ -321,7 +365,7 @@ Si la valeur d'une option est un tableau, il faut l'envelopper dans un tableau s
 
 ---
 
-## 9. Les timeouts de fixture
+## 10. Les timeouts de fixture
 
 Le temps d'exécution d'une fixture est **inclus dans le timeout du test**. Si votre test a trente secondes et que la fixture en consomme vingt-cinq à peupler une base, il reste cinq secondes au test lui-même. L'échec qui en résulte pointe le test, alors que la cause est dans le setup.
 
@@ -337,27 +381,6 @@ seedDatabase: [async ({}, use) => {
 La fixture a alors son propre budget, et le timeout du test ne couvre plus que le code du test.
 
 Les fixtures worker-scoped disposent déjà d'un timeout séparé, égal au timeout de test par défaut. Vous pouvez le redéfinir de la même façon.
-
----
-
-## 10. Redéfinir une fixture native
-
-On peut surcharger les fixtures fournies par Playwright, y compris `page` et `context`. C'est le moyen le plus propre d'appliquer un comportement à toute la suite.
-
-```ts
-page: async ({ page, blockedDomains }, use) => {
-  for (const domain of blockedDomains) {
-    await page.route(domain, route => route.abort());
-  }
-  await use(page);
-},
-```
-
-Deux bénéfices. Les tests gagnent plusieurs centaines de millisecondes chacun, ce qui se voit sur une régression complète. Et surtout, la suite ne dépend plus de la disponibilité de services tiers sur lesquels personne n'a la main. Un test qui échoue parce qu'un CDN d'analytics répond en trois secondes mesure autre chose que ce qu'il prétend mesurer.
-
-Noter que la liste de domaines passe par une option (section 8) plutôt que d'être codée en dur. Cette liste vieillit à chaque outil que le marketing ajoute au site, elle n'a pas sa place dans le code des fixtures.
-
-**Quand vous surchargez une fixture native, vous devez toujours appeler `use()` avec elle.** Vous enrichissez le comportement, vous ne le remplacez pas. Et la surcharge s'applique à tous les tests qui importent votre `test` custom : assurez-vous que c'est bien l'intention.
 
 ---
 
@@ -491,7 +514,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
 
   // ---------- worker ----------
   adminToken: [async ({ playwright }, use) => {
-    /* voir section 6 */
+    /* voir section 7 */
   }, { scope: 'worker' }],
 
   // ---------- services ----------
@@ -523,7 +546,7 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
 
   // ---------- instrumentation ----------
   consoleGuard: [async ({ page }, use, testInfo) => {
-    /* voir section 7 */
+    /* voir section 8 */
   }, { auto: true, box: true }],
 });
 
