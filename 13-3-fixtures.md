@@ -44,7 +44,7 @@ test.afterEach(async ({ request }) => {
 
 Quatre défauts, par ordre de gravité croissante.
 
-**La variable partagée.** `userId` vit au niveau du fichier. En parallèle chaque test a son propre worker, donc ça tient. Mais le jour où quelqu'un ajoute un `test.describe.serial`, ou déplace une assertion, la variable devient une bombe à retardement.
+**La variable partagée.** `userId` vit au niveau du fichier. Tant que les tests s'exécutent séquentiellement dans leur fichier et que cette variable n'est pas réutilisée de manière concurrente, le problème peut rester invisible — un worker exécute plusieurs tests l'un après l'autre, ce n'est pas un worker par test. Mais cette donnée vit hors du cycle de vie du test, ce qui rend le comportement fragile dès que l'organisation de la suite évolue : un `test.describe.serial` ajouté, l'ordre d'exécution changé, une assertion déplacée, et la variable devient une bombe à retardement.
 
 **Le setup s'exécute toujours.** Sur un fichier de cinquante tests dont dix ont besoin d'un utilisateur, le `beforeEach` en crée cinquante. Quarante appels API inutiles par run, multipliés par le nombre de fichiers.
 
@@ -78,6 +78,15 @@ Une fixture reçoit trois arguments :
 
 Les dépendances sont elles-mêmes des fixtures. C'est ce qui rend le système composable : vous empilez des briques, Playwright résout l'arbre.
 
+> 💡 Si tu débutes avec les fixtures, retiens seulement ceci :
+> - une fixture prépare une dépendance,
+> - `use()` la donne au test,
+> - le code après `use()` nettoie,
+> - elle n'est créée que lorsqu'on la demande,
+> - garde tes données métier en scope test.
+>
+> Tout ce qui suit — scopes worker, fixtures auto, options paramétrables, ordre d'exécution précis, `mergeTests`… — est le niveau avancé. Reviens-y une fois ce socle acquis.
+
 ### La conséquence directe : le lazy loading
 
 Une fixture n'est instanciée que si un test la demande. C'est la vraie différence avec un hook, et elle est mesurable. Sur l'exemple précédent, on passe de cinquante créations d'utilisateur à dix. Sur une suite de régression complète, c'est plusieurs minutes de CI et autant de charge en moins sur l'environnement de test.
@@ -108,6 +117,8 @@ testUser: async ({ userService }, use) => {
 ```
 
 Ce code est correct. C'est même la forme que donne la documentation. Si vous ne retenez qu'une chose du mécanisme des fixtures, retenez celle-là : **la garantie de nettoyage est une propriété du runner, pas une propriété de votre écriture.**
+
+Nuance à garder en tête : ce n'est pas une garantie transactionnelle absolue. Le teardown de fixture est un cycle de vie géré par Playwright tant que le processus worker peut encore exécuter du code — pas une promesse que le nettoyage survit à n'importe quelle circonstance. Les trois cas ci-dessous en sont les limites concrètes.
 
 ### Les trois cas où la garantie ne joue pas
 
@@ -141,14 +152,16 @@ testUser: async ({ userService, walletService }, use) => {
     await walletService.deposit(user.id, 10_000);
     await use(await userService.get(user.id));
   } finally {
-    await userService.delete(user.id).catch(() => {});
+    await userService.delete(user.id).catch((error) => {
+      console.warn(`Cleanup failed for user ${user.id}`, error);
+    });
   }
 },
 ```
 
 Formulé autrement : **le runner couvre l'échec du test, votre `try` couvre l'échec de votre propre setup.** Ce sont deux périmètres distincts, et les confondre conduit à du code défensif inutile sur les fixtures simples, tout en laissant les fixtures composées sans protection là où elles en auraient besoin.
 
-Le `.catch` vide sur la suppression est délibéré. Si le nettoyage échoue, on ne veut pas que cette erreur secondaire masque la cause réelle de l'échec. Un nettoyage raté est un incident d'environnement, pas un résultat de test.
+Le `.catch` sur la suppression est délibéré, mais il ne doit pas être vide. Si le nettoyage échoue, on ne veut pas que cette erreur secondaire masque la cause réelle de l'échec du test — mais l'avaler complètement transforme des ressources orphelines en fantômes silencieux, invisibles jusqu'à ce qu'ils saturent une contrainte d'unicité ailleurs. Un nettoyage raté ne doit généralement pas masquer la cause principale du test, mais il doit rester observable : un `console.warn` minimal comme ci-dessus, ou mieux, une attache au rapport de test.
 
 ---
 
@@ -176,10 +189,10 @@ Par défaut une fixture est test-scoped : une instance neuve par test, isolation
 | Scope | Durée de vie | À utiliser pour |
 |---|---|---|
 | Test (défaut) | Un test | Données métier, Page Objects, tout ce qui est modifié |
-| Worker | Tous les tests d'un worker | Ressources coûteuses et immuables : jeton admin, connexion base, client API |
+| Worker | Tous les tests d'un worker | Ressources coûteuses sans état métier partagé entre tests : jeton admin, connexion base, client API |
 | Auto | Un test ou un worker, sans être demandée | Instrumentation transversale (section 7) |
 
-La règle tient en une ligne : **worker pour ce qui est cher à créer et jamais modifié, test pour tout le reste.**
+La règle tient en une ligne : **worker pour les ressources coûteuses dont l'état peut être partagé sans créer de dépendance entre les tests, test pour tout le reste.** Le critère n'est pas une immutabilité littérale — un client DB ou un service peut techniquement évoluer intérieurement (pool de connexions, cache interne) sans que ce soit un problème. Ce qui compte, c'est l'absence d'état métier qui contaminerait les tests suivants.
 
 ### La contrainte de dépendance
 
@@ -395,7 +408,7 @@ C'est le point où je vois le plus d'erreurs, y compris chez des équipes expér
 
 ### Ce qu'il faut faire à la place
 
-Pour un setup réellement unique et global, ni `beforeAll` ni `globalSetup` ne sont équivalents. Un projet de setup avec `dependencies` est la seule option qui s'exécute une fois, avant tout le reste, avec le reporting et les traces d'un test normal.
+`beforeAll` n'est pas équivalent, on vient de le voir. `globalSetup` existe aussi et s'exécute bien une seule fois — mais il tourne hors du modèle fixtures/reporting de Playwright : pas de traces, pas d'accès aux fixtures normales, pas de ligne dans le rapport HTML. Pour un setup global intégré au modèle Playwright, observable dans les rapports et pouvant utiliser les fonctionnalités normales du runner, privilégie un projet de setup avec `dependencies` plutôt que `globalSetup`.
 
 ```ts
 // playwright.config.ts
@@ -502,7 +515,9 @@ export const test = base.extend<Fixtures, WorkerFixtures>({
       await walletService.deposit(user.id, 10_000);
       await use(await userService.get(user.id));
     } finally {
-      await userService.delete(user.id).catch(() => {});
+      await userService.delete(user.id).catch((error) => {
+        console.warn(`Cleanup failed for user ${user.id}`, error);
+      });
     }
   },
 
