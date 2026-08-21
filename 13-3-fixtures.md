@@ -632,7 +632,7 @@ Noter aussi que l'assertion finale interroge le backend et non l'affichage. Une 
 
 *Extrait du chapitre 13.3. Le livre couvre l'architecture complète d'un framework Playwright : arborescence, Page Objects scopés composant, services API, stratégie de données de test, configuration commentée et intégration CI/CD.*
 
-**Sortie prévue en septembre 2026.**
+**Sortie prévue en fin 2026.**
 
 ---
 
